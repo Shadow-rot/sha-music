@@ -1,0 +1,10 @@
+sha-music-bot
+*.exe
+*.log
+config.yml
+.env
+.DS_Store
+vendor/
+*.swp
+*.swo
+*~
