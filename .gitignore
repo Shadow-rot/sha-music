@@ -1,10 +1,37 @@
-sha-music-bot
-*.exe
-*.log
-config.yml
+# Session files
+session.json
+*.session
+
+# Environment files
 .env
-.DS_Store
+
+# Go build files
+userbot
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
 vendor/
+
+# Go workspace file
+go.work
+
+# IDE files
+.vscode/
+.idea/
 *.swp
 *.swo
 *~
+
+# OS files
+.DS_Store
+Thumbs.db
