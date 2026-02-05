@@ -2,739 +2,334 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"os/signal"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
-	"github.com/go-redis/redis/v8"
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/telegram/auth"
+	"github.com/gotd/td/telegram/message"
+	"github.com/gotd/td/telegram/updates"
 	"github.com/gotd/td/tg"
-	"gopkg.in/yaml.v3"
 )
 
-type Config struct {
-	BotToken  string  `yaml:"bot_token"`
-	APIHash   string  `yaml:"api_hash"`
-	APIID     int     `yaml:"api_id"`
-	RedisURL  string  `yaml:"redis_url"`
-	OwnerID   int64   `yaml:"owner_id"`
-	SudoUsers []int64 `yaml:"sudo_users"`
-	Port      string  `yaml:"port"`
-	SessionString string `yaml:"session_string"`
+const (
+	CommandPrefix = "."
+)
+
+type AFKState struct {
+	mu      sync.RWMutex
+	isAFK   bool
+	reason  string
+	since   time.Time
+	pings   map[int64]int // chatID -> ping count
 }
 
-type Queue struct {
-	ChatID    int64
-	Songs     []Song
-	Current   int
-	IsPlaying bool
-	Volume    int
-	Loop      bool
-	mu        sync.RWMutex
-}
-
-type Song struct {
-	Title     string
-	URL       string
-	FilePath  string
-	Duration  int
-	Requester string
-}
-
-type VoiceCall struct {
-	ChatID   int64
-	Active   bool
-	InputPeer *tg.InputPeerChannel
-	mu       sync.RWMutex
-}
-
-type MusicBot struct {
-	bot       *tgbotapi.BotAPI
-	client    *telegram.Client
-	config    Config
-	queues    map[int64]*Queue
-	calls     map[int64]*VoiceCall
-	redis     *redis.Client
-	mu        sync.RWMutex
-	ctx       context.Context
-}
-
-func LoadConfig() (*Config, error) {
-	data, err := os.ReadFile("config.yml")
-	if err != nil {
-		return nil, err
+func NewAFKState() *AFKState {
+	return &AFKState{
+		pings: make(map[int64]int),
 	}
-	var config Config
-	err = yaml.Unmarshal(data, &config)
-	return &config, err
 }
 
-func NewMusicBot(config Config) (*MusicBot, error) {
-	bot, err := tgbotapi.NewBotAPI(config.BotToken)
-	if err != nil {
-		return nil, err
-	}
-
-	bot.Debug = false
-
-	opt, err := redis.ParseURL(config.RedisURL)
-	if err != nil {
-		opt = &redis.Options{Addr: "localhost:6379"}
-	}
-
-	rdb := redis.NewClient(opt)
-
-	ctx := context.Background()
-
-	return &MusicBot{
-		bot:    bot,
-		config: config,
-		queues: make(map[int64]*Queue),
-		calls:  make(map[int64]*VoiceCall),
-		redis:  rdb,
-		ctx:    ctx,
-	}, nil
+func (a *AFKState) SetAFK(reason string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.isAFK = true
+	a.reason = reason
+	a.since = time.Now()
+	a.pings = make(map[int64]int)
 }
 
-func (mb *MusicBot) IsOwner(userID int64) bool {
-	return userID == mb.config.OwnerID
+func (a *AFKState) UnsetAFK() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.isAFK = false
+	a.reason = ""
+	a.pings = make(map[int64]int)
 }
 
-func (mb *MusicBot) IsSudo(userID int64) bool {
-	if mb.IsOwner(userID) {
-		return true
+func (a *AFKState) IsAFK() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.isAFK
+}
+
+func (a *AFKState) GetInfo() (string, time.Time) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.reason, a.since
+}
+
+func (a *AFKState) IncrementPing(chatID int64) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pings[chatID]++
+	return a.pings[chatID]
+}
+
+type Userbot struct {
+	client *telegram.Client
+	api    *tg.Client
+	sender *message.Sender
+	afk    *AFKState
+	self   *tg.User
+}
+
+func NewUserbot(client *telegram.Client) *Userbot {
+	return &Userbot{
+		client: client,
+		afk:    NewAFKState(),
 	}
-	for _, id := range mb.config.SudoUsers {
-		if id == userID {
-			return true
+}
+
+func (u *Userbot) handleUpdate(ctx context.Context, update tg.UpdatesClass) error {
+	switch upd := update.(type) {
+	case *tg.Updates:
+		for _, msg := range upd.Updates {
+			u.processUpdate(ctx, msg)
 		}
+	case *tg.UpdateShort:
+		u.processUpdate(ctx, upd.Update)
 	}
-	return false
-}
-
-func (mb *MusicBot) GetQueue(chatID int64) *Queue {
-	mb.mu.RLock()
-	q, exists := mb.queues[chatID]
-	mb.mu.RUnlock()
-
-	if !exists {
-		mb.mu.Lock()
-		q = &Queue{
-			ChatID:    chatID,
-			Songs:     []Song{},
-			Current:   -1,
-			Volume:    100,
-			Loop:      false,
-			IsPlaying: false,
-		}
-		mb.queues[chatID] = q
-		mb.mu.Unlock()
-	}
-	return q
-}
-
-func (mb *MusicBot) GetCall(chatID int64) *VoiceCall {
-	mb.mu.RLock()
-	call, exists := mb.calls[chatID]
-	mb.mu.RUnlock()
-
-	if !exists {
-		mb.mu.Lock()
-		call = &VoiceCall{
-			ChatID: chatID,
-			Active: false,
-		}
-		mb.calls[chatID] = call
-		mb.mu.Unlock()
-	}
-	return call
-}
-
-func (mb *MusicBot) DownloadSong(url string, chatID int64) (string, error) {
-	tempDir := filepath.Join("downloads", fmt.Sprintf("%d", chatID))
-	os.MkdirAll(tempDir, 0755)
-
-	outputTemplate := filepath.Join(tempDir, "%(title)s.%(ext)s")
-
-	cmd := exec.Command("yt-dlp",
-		"-x",
-		"--audio-format", "opus",
-		"-o", outputTemplate,
-		"--max-filesize", "100m",
-		"--no-playlist",
-		url,
-	)
-
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("download failed: %v, %s", err, output)
-	}
-
-	files, err := filepath.Glob(filepath.Join(tempDir, "*.opus"))
-	if err != nil || len(files) == 0 {
-		files, _ = filepath.Glob(filepath.Join(tempDir, "*.webm"))
-	}
-	if err != nil || len(files) == 0 {
-		files, _ = filepath.Glob(filepath.Join(tempDir, "*.m4a"))
-	}
-
-	if len(files) == 0 {
-		return "", fmt.Errorf("no audio file found")
-	}
-
-	convertedPath := filepath.Join(tempDir, "audio.raw")
-	cmd = exec.Command("ffmpeg",
-		"-i", files[0],
-		"-f", "s16le",
-		"-ac", "2",
-		"-ar", "48000",
-		"-acodec", "pcm_s16le",
-		"-y",
-		convertedPath,
-	)
-
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("conversion failed: %v", err)
-	}
-
-	return convertedPath, nil
-}
-
-func (mb *MusicBot) JoinVoiceChat(chatID int64) error {
-	call := mb.GetCall(chatID)
-	call.mu.Lock()
-	defer call.mu.Unlock()
-
-	if call.Active {
-		return nil
-	}
-
-	call.Active = true
 	return nil
 }
 
-func (mb *MusicBot) LeaveVoiceChat(chatID int64) error {
-	call := mb.GetCall(chatID)
-	call.mu.Lock()
-	defer call.mu.Unlock()
-
-	if !call.Active {
-		return nil
+func (u *Userbot) processUpdate(ctx context.Context, update tg.UpdateClass) {
+	switch upd := update.(type) {
+	case *tg.UpdateNewMessage:
+		u.handleMessage(ctx, upd.Message)
+	case *tg.UpdateEditMessage:
+		u.handleMessage(ctx, upd.Message)
 	}
-
-	call.Active = false
-
-	tempDir := filepath.Join("downloads", fmt.Sprintf("%d", chatID))
-	os.RemoveAll(tempDir)
-
-	return nil
 }
 
-func (mb *MusicBot) StreamAudio(chatID int64, filePath string) error {
-	call := mb.GetCall(chatID)
-	call.mu.RLock()
-	active := call.Active
-	call.mu.RUnlock()
-
-	if !active {
-		return fmt.Errorf("not in voice chat")
+func (u *Userbot) handleMessage(ctx context.Context, msg tg.MessageClass) {
+	message, ok := msg.(*tg.Message)
+	if !ok || message.Out {
+		return
 	}
 
-	return nil
+	text := message.Message
+	chatID := u.getChatID(message.PeerID)
+
+	// Handle AFK mentions in DMs
+	if u.afk.IsAFK() && u.isDM(message.PeerID) {
+		reason, since := u.afk.GetInfo()
+		duration := time.Since(since)
+		
+		afkMsg := fmt.Sprintf("🌙 I'm currently AFK")
+		if reason != "" {
+			afkMsg += fmt.Sprintf(": %s", reason)
+		}
+		afkMsg += fmt.Sprintf("\n⏰ Since: %s ago", formatDuration(duration))
+		
+		count := u.afk.IncrementPing(chatID)
+		if count == 1 {
+			u.sender.Reply(u.api, message).Text(ctx, afkMsg)
+		}
+	}
+
+	// Handle commands from self
+	if !u.isFromSelf(message) {
+		return
+	}
+
+	if !strings.HasPrefix(text, CommandPrefix) {
+		// If user is AFK and sends a message, unset AFK
+		if u.afk.IsAFK() {
+			u.afk.UnsetAFK()
+			u.sender.Reply(u.api, message).Text(ctx, "✅ AFK mode disabled")
+		}
+		return
+	}
+
+	parts := strings.Fields(text)
+	if len(parts) == 0 {
+		return
+	}
+
+	command := strings.TrimPrefix(parts[0], CommandPrefix)
+	args := parts[1:]
+
+	switch command {
+	case "del", "delete":
+		u.handleDelete(ctx, message)
+	case "alive":
+		u.handleAlive(ctx, message)
+	case "afk":
+		u.handleAFK(ctx, message, args)
+	}
 }
 
-func (mb *MusicBot) HandleStart(chatID int64, userID int64) {
-	keyboard := tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("🎵 Help", "help"),
-			tgbotapi.NewInlineKeyboardButtonData("ℹ️ About", "about"),
-		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("➕ Add Me", "addme"),
-			tgbotapi.NewInlineKeyboardButtonData("📢 Support", "support"),
-		),
+func (u *Userbot) handleDelete(ctx context.Context, msg *tg.Message) {
+	// Delete the command message
+	peer := u.getPeer(msg.PeerID)
+	u.api.MessagesDeleteMessages(ctx, &tg.MessagesDeleteMessagesRequest{
+		ID: []int{msg.ID},
+	})
+
+	// If replying to a message, delete that too
+	if msg.ReplyTo != nil {
+		if replyTo, ok := msg.ReplyTo.(*tg.MessageReplyHeader); ok {
+			u.api.MessagesDeleteMessages(ctx, &tg.MessagesDeleteMessagesRequest{
+				ID: []int{replyTo.ReplyToMsgID},
+			})
+		}
+	}
+
+	log.Printf("Deleted message(s) in chat %v", peer)
+}
+
+func (u *Userbot) handleAlive(ctx context.Context, msg *tg.Message) {
+	uptime := time.Since(time.Now().Add(-5 * time.Minute)) // Simplified uptime
+	
+	aliveMsg := fmt.Sprintf(
+		"🤖 **Userbot Status**\n\n"+
+			"✅ Online and Running\n"+
+			"⏱ Uptime: %s\n"+
+			"📝 Commands: .del, .alive, .afk",
+		formatDuration(uptime),
 	)
 
-	text := `👋 <b>Welcome to Sha Music Bot!</b>
-
-🎶 <b>High-Quality Music Player for Voice Chats</b>
-
-<b>✨ Features:</b>
-• Play from YouTube, Spotify
-• Queue management
-• High-quality audio
-• Fast & Reliable
-
-<b>🚀 Quick Start:</b>
-1. Add me to your group
-2. Make me admin with voice chat rights
-3. Start voice chat
-4. Use /play [song name]
-
-⚡ <b>Powered by ntgcalls</b>`
-
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = "HTML"
-	msg.ReplyMarkup = keyboard
-	mb.bot.Send(msg)
+	u.sender.Reply(u.api, msg).Text(ctx, aliveMsg)
 }
 
-func (mb *MusicBot) HandleHelp(chatID int64) {
-	text := `<b>📖 Sha Music Bot Commands</b>
-
-<b>🎵 Playback:</b>
-/play [song/url] - Play song
-/pause - Pause playback
-/resume - Resume playback
-/skip - Skip current song
-/stop - Stop & clear queue
-/end - Leave voice chat
-
-<b>📋 Queue Management:</b>
-/queue - Show queue
-/shuffle - Shuffle queue
-/loop - Toggle loop mode
-/clearqueue - Clear queue
-
-<b>🎛 Audio Controls:</b>
-/volume [1-200] - Set volume
-/current - Current playing
-/lyrics - Get lyrics
-
-<b>⚡ Admin Commands:</b>
-/forceplay [song] - Force play
-/channelplay - Channel mode
-/skip [number] - Skip to position
-
-<b>👑 Sudo/Owner:</b>
-/addsudo [id] - Add sudo user
-/rmsudo [id] - Remove sudo
-/broadcast [text] - Broadcast
-/stats - Statistics
-/restart - Restart bot
-
-<b>💡 Supported:</b>
-YouTube, Spotify, SoundCloud, Direct links`
-
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = "HTML"
-	mb.bot.Send(msg)
-}
-
-func (mb *MusicBot) HandlePlay(chatID int64, userID int64, query string, username string) {
-	if query == "" {
-		msg := tgbotapi.NewMessage(chatID, "❌ Please provide a song name or URL!")
-		mb.bot.Send(msg)
+func (u *Userbot) handleAFK(ctx context.Context, msg *tg.Message, args []string) {
+	if u.afk.IsAFK() {
+		u.afk.UnsetAFK()
+		u.sender.Reply(u.api, msg).Text(ctx, "✅ AFK mode disabled")
 		return
 	}
 
-	statusMsg := tgbotapi.NewMessage(chatID, "🔍 Searching and downloading...")
-	sentMsg, _ := mb.bot.Send(statusMsg)
+	reason := strings.Join(args, " ")
+	u.afk.SetAFK(reason)
 
-	var url string
-	if strings.HasPrefix(query, "http") {
-		url = query
-	} else {
-		url = fmt.Sprintf("ytsearch:%s", query)
+	afkMsg := "🌙 AFK mode enabled"
+	if reason != "" {
+		afkMsg += fmt.Sprintf(": %s", reason)
 	}
 
-	filePath, err := mb.DownloadSong(url, chatID)
-	if err != nil {
-		editMsg := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, 
-			fmt.Sprintf("❌ Download failed: %v", err))
-		mb.bot.Send(editMsg)
-		return
-	}
-
-	song := Song{
-		Title:     query,
-		URL:       url,
-		FilePath:  filePath,
-		Duration:  180,
-		Requester: username,
-	}
-
-	queue := mb.GetQueue(chatID)
-	queue.mu.Lock()
-	queue.Songs = append(queue.Songs, song)
-	position := len(queue.Songs)
-	wasPlaying := queue.IsPlaying
-	queue.mu.Unlock()
-
-	if !wasPlaying {
-		if err := mb.JoinVoiceChat(chatID); err != nil {
-			editMsg := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID,
-				fmt.Sprintf("❌ Failed to join voice chat: %v", err))
-			mb.bot.Send(editMsg)
-			return
-		}
-
-		go mb.PlayNext(chatID)
-
-		text := fmt.Sprintf("▶️ <b>Now Playing:</b>\n\n"+
-			"🎵 <b>%s</b>\n"+
-			"👤 Requested by: @%s\n"+
-			"🔊 Volume: %d%%",
-			song.Title, username, queue.Volume)
-
-		editMsg := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, text)
-		editMsg.ParseMode = "HTML"
-		mb.bot.Send(editMsg)
-	} else {
-		text := fmt.Sprintf("✅ <b>Added to Queue</b>\n\n"+
-			"🎵 <b>%s</b>\n"+
-			"📍 Position: <b>%d</b>\n"+
-			"👤 Requested by: @%s",
-			song.Title, position, username)
-
-		editMsg := tgbotapi.NewEditMessageText(chatID, sentMsg.MessageID, text)
-		editMsg.ParseMode = "HTML"
-		mb.bot.Send(editMsg)
-	}
+	u.sender.Reply(u.api, msg).Text(ctx, afkMsg)
 }
 
-func (mb *MusicBot) PlayNext(chatID int64) {
-	queue := mb.GetQueue(chatID)
-	queue.mu.Lock()
-
-	if len(queue.Songs) == 0 {
-		queue.IsPlaying = false
-		queue.Current = -1
-		queue.mu.Unlock()
-		mb.LeaveVoiceChat(chatID)
-		msg := tgbotapi.NewMessage(chatID, "✅ Queue finished! Leaving voice chat.")
-		mb.bot.Send(msg)
-		return
+func (u *Userbot) getChatID(peerID tg.PeerClass) int64 {
+	switch peer := peerID.(type) {
+	case *tg.PeerUser:
+		return peer.UserID
+	case *tg.PeerChat:
+		return peer.ChatID
+	case *tg.PeerChannel:
+		return peer.ChannelID
 	}
-
-	if queue.Loop && queue.Current >= 0 {
-	} else {
-		queue.Current++
-		if queue.Current >= len(queue.Songs) {
-			queue.Current = 0
-		}
-	}
-
-	song := queue.Songs[queue.Current]
-	queue.IsPlaying = true
-	queue.mu.Unlock()
-
-	keyboard := tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("⏸", "pause"),
-			tgbotapi.NewInlineKeyboardButtonData("▶️", "resume"),
-			tgbotapi.NewInlineKeyboardButtonData("⏭", "skip"),
-		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("🔉", "vol_down"),
-			tgbotapi.NewInlineKeyboardButtonData("🔊", "vol_up"),
-			tgbotapi.NewInlineKeyboardButtonData("⏹", "stop"),
-		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("🔁", "loop"),
-			tgbotapi.NewInlineKeyboardButtonData("📋", "queue"),
-		),
-	)
-
-	text := fmt.Sprintf("▶️ <b>Now Playing</b>\n\n"+
-		"🎵 <b>%s</b>\n"+
-		"⏱ Duration: %d:%02d\n"+
-		"👤 Requested by: @%s\n"+
-		"📍 Position: %d/%d\n"+
-		"🔊 Volume: %d%%",
-		song.Title,
-		song.Duration/60, song.Duration%60,
-		song.Requester,
-		queue.Current+1, len(queue.Songs),
-		queue.Volume)
-
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = "HTML"
-	msg.ReplyMarkup = keyboard
-	mb.bot.Send(msg)
-
-	if err := mb.StreamAudio(chatID, song.FilePath); err != nil {
-		errorMsg := tgbotapi.NewMessage(chatID, 
-			fmt.Sprintf("❌ Playback error: %v", err))
-		mb.bot.Send(errorMsg)
-	}
-
-	time.Sleep(time.Duration(song.Duration) * time.Second)
-
-	queue.mu.Lock()
-	if !queue.Loop {
-		queue.Songs = append(queue.Songs[:queue.Current], queue.Songs[queue.Current+1:]...)
-		queue.Current--
-	}
-	queue.mu.Unlock()
-
-	go mb.PlayNext(chatID)
+	return 0
 }
 
-func (mb *MusicBot) HandleSkip(chatID int64, userID int64) {
-	queue := mb.GetQueue(chatID)
-	queue.mu.RLock()
-	isPlaying := queue.IsPlaying
-	queue.mu.RUnlock()
-
-	if !isPlaying {
-		msg := tgbotapi.NewMessage(chatID, "❌ Nothing is playing!")
-		mb.bot.Send(msg)
-		return
+func (u *Userbot) getPeer(peerID tg.PeerClass) tg.InputPeerClass {
+	switch peer := peerID.(type) {
+	case *tg.PeerUser:
+		return &tg.InputPeerUser{UserID: peer.UserID}
+	case *tg.PeerChat:
+		return &tg.InputPeerChat{ChatID: peer.ChatID}
+	case *tg.PeerChannel:
+		return &tg.InputPeerChannel{ChannelID: peer.ChannelID}
 	}
-
-	msg := tgbotapi.NewMessage(chatID, "⏭ Skipped!")
-	mb.bot.Send(msg)
-
-	queue.mu.Lock()
-	if queue.Current < len(queue.Songs) && !queue.Loop {
-		os.Remove(queue.Songs[queue.Current].FilePath)
-		queue.Songs = append(queue.Songs[:queue.Current], queue.Songs[queue.Current+1:]...)
-		queue.Current--
-	}
-	queue.mu.Unlock()
-
-	go mb.PlayNext(chatID)
+	return &tg.InputPeerEmpty{}
 }
 
-func (mb *MusicBot) HandlePause(chatID int64) {
-	msg := tgbotapi.NewMessage(chatID, "⏸ Paused!")
-	mb.bot.Send(msg)
+func (u *Userbot) isDM(peerID tg.PeerClass) bool {
+	_, ok := peerID.(*tg.PeerUser)
+	return ok
 }
 
-func (mb *MusicBot) HandleResume(chatID int64) {
-	msg := tgbotapi.NewMessage(chatID, "▶️ Resumed!")
-	mb.bot.Send(msg)
+func (u *Userbot) isFromSelf(msg *tg.Message) bool {
+	if u.self == nil {
+		return false
+	}
+	return msg.FromID != nil && u.getSenderID(msg.FromID) == u.self.ID
 }
 
-func (mb *MusicBot) HandleStop(chatID int64, userID int64) {
-	queue := mb.GetQueue(chatID)
-	queue.mu.Lock()
-
-	for _, song := range queue.Songs {
-		os.Remove(song.FilePath)
+func (u *Userbot) getSenderID(fromID tg.PeerClass) int64 {
+	switch peer := fromID.(type) {
+	case *tg.PeerUser:
+		return peer.UserID
 	}
-
-	queue.Songs = []Song{}
-	queue.Current = -1
-	queue.IsPlaying = false
-	queue.mu.Unlock()
-
-	mb.LeaveVoiceChat(chatID)
-
-	msg := tgbotapi.NewMessage(chatID, "⏹ Stopped and cleared queue!")
-	mb.bot.Send(msg)
+	return 0
 }
 
-func (mb *MusicBot) HandleQueue(chatID int64) {
-	queue := mb.GetQueue(chatID)
-	queue.mu.RLock()
-	defer queue.mu.RUnlock()
-
-	if len(queue.Songs) == 0 {
-		msg := tgbotapi.NewMessage(chatID, "📭 Queue is empty!")
-		mb.bot.Send(msg)
-		return
+func formatDuration(d time.Duration) string {
+	hours := int(d.Hours())
+	minutes := int(d.Minutes()) % 60
+	
+	if hours > 0 {
+		return fmt.Sprintf("%dh %dm", hours, minutes)
 	}
-
-	text := fmt.Sprintf("<b>📋 Current Queue</b>\n\n"+
-		"🔊 Volume: %d%%\n"+
-		"🔁 Loop: %v\n\n", queue.Volume, queue.Loop)
-
-	for i, song := range queue.Songs {
-		prefix := "  "
-		if i == queue.Current {
-			prefix = "▶️"
-		}
-		text += fmt.Sprintf("%s <b>%d.</b> %s\n   👤 @%s\n\n",
-			prefix, i+1, song.Title, song.Requester)
-	}
-
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = "HTML"
-	mb.bot.Send(msg)
-}
-
-func (mb *MusicBot) HandleVolume(chatID int64, volume int) {
-	if volume < 1 || volume > 200 {
-		msg := tgbotapi.NewMessage(chatID, "❌ Volume must be between 1-200")
-		mb.bot.Send(msg)
-		return
-	}
-
-	queue := mb.GetQueue(chatID)
-	queue.mu.Lock()
-	queue.Volume = volume
-	queue.mu.Unlock()
-
-	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("🔊 Volume set to %d%%", volume))
-	mb.bot.Send(msg)
-}
-
-func (mb *MusicBot) HandleLoop(chatID int64) {
-	queue := mb.GetQueue(chatID)
-	queue.mu.Lock()
-	queue.Loop = !queue.Loop
-	loopStatus := queue.Loop
-	queue.mu.Unlock()
-
-	status := "disabled"
-	if loopStatus {
-		status = "enabled"
-	}
-
-	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("🔁 Loop %s", status))
-	mb.bot.Send(msg)
-}
-
-func (mb *MusicBot) HandleStats(chatID int64, userID int64) {
-	if !mb.IsSudo(userID) {
-		msg := tgbotapi.NewMessage(chatID, "❌ Sudo only!")
-		mb.bot.Send(msg)
-		return
-	}
-
-	mb.mu.RLock()
-	activeChats := len(mb.queues)
-	activeCalls := 0
-	for _, call := range mb.calls {
-		if call.Active {
-			activeCalls++
-		}
-	}
-	mb.mu.RUnlock()
-
-	text := fmt.Sprintf("<b>📊 Bot Statistics</b>\n\n"+
-		"🎵 Active Chats: %d\n"+
-		"📞 Active Calls: %d\n"+
-		"👥 Sudo Users: %d\n"+
-		"⚡ Status: <b>Online</b>\n"+
-		"🚀 Version: <b>2.0.0</b>",
-		activeChats, activeCalls, len(mb.config.SudoUsers))
-
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = "HTML"
-	mb.bot.Send(msg)
-}
-
-func (mb *MusicBot) HandleCallback(callback *tgbotapi.CallbackQuery) {
-	chatID := callback.Message.Chat.ID
-	data := callback.Data
-
-	switch data {
-	case "help":
-		mb.HandleHelp(chatID)
-	case "pause":
-		mb.HandlePause(chatID)
-	case "resume":
-		mb.HandleResume(chatID)
-	case "skip":
-		mb.HandleSkip(chatID, callback.From.ID)
-	case "stop":
-		mb.HandleStop(chatID, callback.From.ID)
-	case "loop":
-		mb.HandleLoop(chatID)
-	case "queue":
-		mb.HandleQueue(chatID)
-	case "vol_up":
-		queue := mb.GetQueue(chatID)
-		newVol := queue.Volume + 10
-		if newVol > 200 {
-			newVol = 200
-		}
-		mb.HandleVolume(chatID, newVol)
-	case "vol_down":
-		queue := mb.GetQueue(chatID)
-		newVol := queue.Volume - 10
-		if newVol < 1 {
-			newVol = 1
-		}
-		mb.HandleVolume(chatID, newVol)
-	}
-
-	answer := tgbotapi.NewCallback(callback.ID, "")
-	mb.bot.Request(answer)
-}
-
-func (mb *MusicBot) Start() {
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
-
-	updates := mb.bot.GetUpdatesChan(u)
-
-	log.Printf("✅ Sha Music Bot started as @%s", mb.bot.Self.UserName)
-	log.Printf("🎵 Ready to play music in voice chats!")
-
-	for update := range updates {
-		if update.Message != nil {
-			chatID := update.Message.Chat.ID
-			userID := update.Message.From.ID
-			username := update.Message.From.UserName
-
-			if update.Message.IsCommand() {
-				command := update.Message.Command()
-				args := update.Message.CommandArguments()
-
-				switch command {
-				case "start":
-					mb.HandleStart(chatID, userID)
-				case "help":
-					mb.HandleHelp(chatID)
-				case "play", "p":
-					mb.HandlePlay(chatID, userID, args, username)
-				case "pause":
-					mb.HandlePause(chatID)
-				case "resume":
-					mb.HandleResume(chatID)
-				case "skip", "next":
-					mb.HandleSkip(chatID, userID)
-				case "stop", "end":
-					mb.HandleStop(chatID, userID)
-				case "queue", "q":
-					mb.HandleQueue(chatID)
-				case "volume", "vol":
-					if args != "" {
-						vol, _ := strconv.Atoi(args)
-						mb.HandleVolume(chatID, vol)
-					}
-				case "loop":
-					mb.HandleLoop(chatID)
-				case "stats":
-					mb.HandleStats(chatID, userID)
-				}
-			}
-		} else if update.CallbackQuery != nil {
-			mb.HandleCallback(update.CallbackQuery)
-		}
-	}
+	return fmt.Sprintf("%dm", minutes)
 }
 
 func main() {
-	config, err := LoadConfig()
-	if err != nil {
-		log.Fatal("❌ Failed to load config:", err)
+	apiID := os.Getenv("API_ID")
+	apiHash := os.Getenv("API_HASH")
+	phone := os.Getenv("PHONE")
+
+	if apiID == "" || apiHash == "" || phone == "" {
+		log.Fatal("Please set API_ID, API_HASH, and PHONE environment variables")
 	}
 
-	bot, err := NewMusicBot(*config)
-	if err != nil {
-		log.Fatal("❌ Failed to create bot:", err)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	client := telegram.NewClient(mustParseInt(apiID), apiHash, telegram.Options{
+		SessionStorage: &telegram.FileSessionStorage{
+			Path: "session.json",
+		},
+	})
+
+	bot := NewUserbot(client)
+
+	if err := client.Run(ctx, func(ctx context.Context) error {
+		// Get API client
+		bot.api = client.API()
+		bot.sender = message.NewSender(bot.api)
+
+		// Auth
+		if err := client.Auth().IfNecessary(ctx, auth.SendCodeOptions{
+			Phone: phone,
+		}); err != nil {
+			return fmt.Errorf("auth error: %w", err)
+		}
+
+		// Get self info
+		self, err := bot.api.UsersGetUsers(ctx, []tg.InputUserClass{&tg.InputUserSelf{}})
+		if err != nil {
+			return fmt.Errorf("failed to get self: %w", err)
+		}
+		if len(self) > 0 {
+			if user, ok := self[0].(*tg.User); ok {
+				bot.self = user
+				log.Printf("Logged in as: %s %s (@%s)", user.FirstName, user.LastName, user.Username)
+			}
+		}
+
+		// Setup update handler
+		gaps := updates.New(updates.Config{
+			Handler: bot.handleUpdate,
+		})
+
+		// Start receiving updates
+		return gaps.Run(ctx, bot.api, bot.self.ID, updates.AuthOptions{
+			Phone: phone,
+		})
+	}); err != nil {
+		log.Fatal(err)
 	}
+}
 
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-
-	go bot.Start()
-
-	<-quit
-	log.Println("👋 Shutting down bot...")
+func mustParseInt(s string) int {
+	var i int
+	fmt.Sscanf(s, "%d", &i)
+	return i
 }
