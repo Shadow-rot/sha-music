@@ -1,1 +1,0 @@
-worker: ./sha-music-bot
